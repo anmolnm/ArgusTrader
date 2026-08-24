@@ -1,0 +1,4 @@
+alpaca-py>=0.44.0
+yfinance>=1.6.0
+pandas>=2.0.0
+ta>=0.11.0
