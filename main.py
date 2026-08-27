@@ -50,6 +50,15 @@ ET = ZoneInfo("America/New_York")
 MACRO_SENTIMENT = "NEUTRAL"
 
 
+def get_server_time(executor: TradeExecutor) -> datetime:
+    """Use Alpaca's clock so market decisions share the broker's time base."""
+    try:
+        return executor.get_clock().timestamp.astimezone(ET)
+    except Exception as e:
+        logger.warning("Alpaca clock unavailable; using local time: %s", e)
+        return datetime.now(ET)
+
+
 def is_market_open(now_et: datetime) -> bool:
     open_t = dtime(config.MARKET_OPEN_HOUR_ET, config.MARKET_OPEN_MINUTE_ET)
     close_t = dtime(config.MARKET_CLOSE_HOUR_ET, config.MARKET_CLOSE_MINUTE_ET)
@@ -63,6 +72,12 @@ def is_past_entry_cutoff(now_et: datetime) -> bool:
 
 def handle_signal(signal, executor: TradeExecutor, risk_agent: RuleBasedRiskAgent, now_et: datetime):
     symbol = signal.symbol
+    with executor.symbol_lock(symbol):
+        _handle_signal_locked(signal, executor, risk_agent, now_et)
+
+
+def _handle_signal_locked(signal, executor: TradeExecutor, risk_agent: RuleBasedRiskAgent, now_et: datetime):
+    symbol = signal.symbol
     position = executor.get_position(symbol)
     current_side = None
     if position is not None:
@@ -74,7 +89,12 @@ def handle_signal(signal, executor: TradeExecutor, risk_agent: RuleBasedRiskAgen
             logger.info("%s: closing short position (trend reversal)", symbol)
             decision = risk_agent.evaluate(symbol, signal.direction, MACRO_SENTIMENT, is_exit=True)
             if decision.approved:
-                executor.close_position(symbol)
+                if not executor.close_position(symbol, wait_for_settle=True):
+                    logger.error("%s: reversal close failed; skipping new entry", symbol)
+                    return
+            else:
+                logger.warning("%s: reversal close rejected by risk agent; skipping new entry", symbol)
+                return
         elif current_side == "long":
             logger.info("%s: already long, skipping duplicate signal", symbol)
             return
@@ -84,7 +104,12 @@ def handle_signal(signal, executor: TradeExecutor, risk_agent: RuleBasedRiskAgen
             logger.info("%s: closing long position (trend reversal)", symbol)
             decision = risk_agent.evaluate(symbol, signal.direction, MACRO_SENTIMENT, is_exit=True)
             if decision.approved:
-                executor.close_position(symbol)
+                if not executor.close_position(symbol, wait_for_settle=True):
+                    logger.error("%s: reversal close failed; skipping new entry", symbol)
+                    return
+            else:
+                logger.warning("%s: reversal close rejected by risk agent; skipping new entry", symbol)
+                return
         elif current_side == "short":
             logger.info("%s: already short, skipping duplicate signal", symbol)
             return
@@ -129,10 +154,20 @@ def handle_signal(signal, executor: TradeExecutor, risk_agent: RuleBasedRiskAgen
 
 
 def run_once(executor: TradeExecutor, engine: SignalEngine, risk_agent: RuleBasedRiskAgent):
-    now_et = datetime.now(ET)
+    now_et = get_server_time(executor)
     signals = engine.scan_watchlist(macro_sentiment=MACRO_SENTIMENT)
     for signal in signals:
         handle_signal(signal, executor, risk_agent, now_et)
+
+
+def maybe_close_end_of_day(executor: TradeExecutor, now_et: datetime, closed_date):
+    close_time = dtime(config.MARKET_CLOSE_HOUR_ET, config.MARKET_CLOSE_MINUTE_ET)
+    minutes_to_close = (datetime.combine(now_et.date(), close_time, tzinfo=ET) - now_et).total_seconds() / 60
+    if 0 <= minutes_to_close <= config.EOD_CLOSE_MINUTES_BEFORE and closed_date != now_et.date():
+        logger.info("End-of-day shutdown: closing all positions and canceling orders")
+        executor.close_all_positions()
+        return now_et.date()
+    return closed_date
 
 
 def main():
@@ -144,12 +179,15 @@ def main():
 
     engine = SignalEngine()
     risk_agent = RuleBasedRiskAgent()
+    executor.reconcile_orders()
+    closed_date = None
 
     logger.info("Bot V2 starting. Watchlist: %s", config.WATCHLIST)
 
     while True:
-        now_et = datetime.now(ET)
-        if is_market_open(now_et):
+        now_et = get_server_time(executor)
+        closed_date = maybe_close_end_of_day(executor, now_et, closed_date)
+        if is_market_open(now_et) and closed_date != now_et.date():
             try:
                 run_once(executor, engine, risk_agent)
             except Exception as e:

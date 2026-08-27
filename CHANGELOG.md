@@ -2,6 +2,19 @@
 
 ## Unreleased -- fill-race-condition fix (from Aug 21 & 24 log analysis)
 
+### Added after Aug 25-26 log review
+- **`trading_core.py`**: cancels symbol-scoped open orders before exits and
+  waits for Alpaca to release reserved shares, eliminating trailing-stop
+  reservation conflicts during reversals.
+- **`trading_core.py`**: reconciles positions and open orders at startup,
+  cancels orphan orders, and restores missing whole-share trailing stops.
+- **`trading_core.py`**: serializes operations per symbol so concurrent signal
+  sources cannot issue conflicting orders for the same ticker.
+- **`main.py`**: uses Alpaca's server clock, performs one end-of-day
+  liquidation window, and skips signal scans after liquidation.
+- **`tests/test_trading_core.py`**: adds mock coverage for cancellation,
+  cancellation timeouts, and startup protection repair.
+
 ### Fixed
 - **`trading_core.py`**: `enter_long` / `enter_short` now wait for the
   entry order to reach a confirmed fill status (`_wait_for_fill`,

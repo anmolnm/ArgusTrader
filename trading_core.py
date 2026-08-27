@@ -12,13 +12,15 @@ trying something insecure.
 
 import logging
 import math
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, TrailingStopOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderStatus
+from alpaca.trading.requests import MarketOrderRequest, TrailingStopOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderStatus, QueryOrderStatus
 
 import config
 
@@ -34,6 +36,7 @@ ORDER_FILL_POLL_INTERVAL_SECONDS = 0.3
 ORDER_FILL_TIMEOUT_SECONDS = 10
 STOP_PLACEMENT_MAX_ATTEMPTS = 3
 STOP_PLACEMENT_RETRY_DELAY_SECONDS = 1.0
+ORDER_CANCEL_TIMEOUT_SECONDS = 5
 
 FILLED_STATUSES = {OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED}
 
@@ -77,6 +80,8 @@ class TradeExecutor:
             config.ALPACA_SECRET_KEY,
             paper=config.ALPACA_PAPER,
         )
+        self._symbol_locks = {}
+        self._symbol_locks_guard = threading.Lock()
         logger.info("Connected to Alpaca (%s)", "paper" if config.ALPACA_PAPER else "LIVE")
 
     # ------------------------------------------------------------------
@@ -85,6 +90,16 @@ class TradeExecutor:
 
     def get_account(self):
         return self.client.get_account()
+
+    def get_clock(self):
+        return self.client.get_clock()
+
+    @contextmanager
+    def symbol_lock(self, symbol: str):
+        with self._symbol_locks_guard:
+            lock = self._symbol_locks.setdefault(symbol, threading.Lock())
+        with lock:
+            yield
 
     def get_open_positions(self):
         return self.client.get_all_positions()
@@ -247,6 +262,63 @@ class TradeExecutor:
     # Exit / protection
     # ------------------------------------------------------------------
 
+    def reconcile_orders(self) -> None:
+        """Repair protection for positions and cancel orders with no position."""
+        try:
+            positions = {position.symbol: position for position in self.get_open_positions()}
+            open_orders = self.client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
+            orders_by_symbol = {}
+            for order in open_orders:
+                orders_by_symbol.setdefault(order.symbol, []).append(order)
+
+            for symbol, orders in orders_by_symbol.items():
+                if symbol not in positions:
+                    for order in orders:
+                        self.client.cancel_order_by_id(order.id)
+                        logger.warning("Canceled orphan open order for %s: %s", symbol, order.id)
+
+            for symbol, position in positions.items():
+                position_qty = math.floor(abs(float(position.qty)))
+                if position_qty <= 0:
+                    logger.warning("%s has only fractional quantity; no trailing stop placed", symbol)
+                    continue
+                position_side = "long" if float(position.qty) > 0 else "short"
+                expected_side = OrderSide.SELL if position_side == "long" else OrderSide.BUY
+                protected = any(
+                    order.type == OrderType.TRAILING_STOP and order.side == expected_side
+                    for order in orders_by_symbol.get(symbol, [])
+                )
+                if not protected:
+                    stop_id = self._place_trailing_stop_with_retry(
+                        symbol, expected_side, config.DEFAULT_STOP_LOSS_PCT, qty=position_qty,
+                    )
+                    if stop_id:
+                        logger.info("Startup protection restored for %s", symbol)
+                    else:
+                        logger.error("Startup protection could not be restored for %s", symbol)
+        except Exception as e:
+            logger.error("Startup order reconciliation failed: %s", e, exc_info=True)
+
+    def cancel_open_orders(self, symbol: str) -> bool:
+        """Cancel open orders for a symbol before closing or reversing it."""
+        try:
+            request = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
+            orders = self.client.get_orders(request)
+            for order in orders:
+                self.client.cancel_order_by_id(order.id)
+                logger.info("Canceled open order for %s: %s", symbol, order.id)
+
+            deadline = time.monotonic() + ORDER_CANCEL_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                if not self.client.get_orders(request):
+                    return True
+                time.sleep(ORDER_FILL_POLL_INTERVAL_SECONDS)
+            logger.error("Open orders for %s remained after cancellation timeout", symbol)
+            return False
+        except Exception as e:
+            logger.error("Failed to cancel open orders for %s: %s", symbol, e)
+            return False
+
     def _place_trailing_stop(self, symbol: str, exit_side: OrderSide,
                               trail_percent: float, qty: Optional[int]) -> Optional[str]:
         """
@@ -312,6 +384,8 @@ class TradeExecutor:
         logger.warning("SAFETY NET: closing unprotected position in %s", symbol)
         for attempt in range(1, max_attempts + 1):
             try:
+                if not self.cancel_open_orders(symbol):
+                    return
                 self.client.close_position(symbol)
                 logger.info("SAFETY NET: successfully closed unprotected position in %s", symbol)
                 return
@@ -336,6 +410,9 @@ class TradeExecutor:
         rejected with "insufficient qty available" because the freed
         shares/buying power haven't settled yet.
         """
+        if not self.cancel_open_orders(symbol):
+            return False
+
         try:
             close_order = self.client.close_position(symbol)
             logger.info("Close submitted: %s", symbol)
@@ -349,6 +426,7 @@ class TradeExecutor:
                 filled = self._wait_for_fill(order_id)
                 if filled is None or filled.status not in FILLED_STATUSES:
                     logger.warning("%s: close order did not confirm fill before timeout", symbol)
+                    return False
         logger.info("Closed position: %s", symbol)
         return True
 

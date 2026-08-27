@@ -81,9 +81,10 @@ candle setup), and only trades during regular market hours (9:30 AM -
 - **`trading_core.py`** -- the shared `TradeExecutor`: Alpaca connection,
   position sizing from cash and directional %, long entries (notional/
   fractional), short entries (whole-share, skips if qty rounds to 0),
-  GTC trailing stops placed immediately after entry, and the
-  "unprotected position" safety net that closes a position if its
-  trailing stop fails to submit.
+  GTC trailing stops placed immediately after entry, startup order
+  reconciliation, symbol-level order coordination, and the "unprotected
+  position" safety net that closes a position if its trailing stop fails to
+  submit.
 - **`indicators.py`** -- SuperTrend, EMA 9/21, RSI, VWAP (resets daily),
   ADX, MACD, and volume-surge detection, all matching the parameters in
   your guide.
@@ -99,8 +100,9 @@ candle setup), and only trades during regular market hours (9:30 AM -
   `.evaluate()` interface, so it's a drop-in swap later.
 - **`main.py`** -- the polling loop: scans the watchlist, applies the
   signal routing logic (reversal closes, skip-if-already-positioned,
-  new entry), and enforces entry rules 3-6 (risk approval, max open
-  positions, entry cutoff at 3:30 PM ET, capital availability).
+  new entry), uses Alpaca server time, closes all positions five minutes
+  before the session close, and enforces entry rules 3-6 (risk approval,
+  max open positions, entry cutoff at 3:30 PM ET, capital availability).
 
 ## 3. What's NOT built yet (from your guide, later phases)
 
@@ -111,11 +113,16 @@ candle setup), and only trades during regular market hours (9:30 AM -
   `ticker_score=5.0` into the risk agent
 - Claude-powered Risk Agent (currently rule-based only, per your choice)
 - VIX watchdog, hourly ticker health checks, negative-headline scanning
-- End-of-day position review (3:55 PM close-if-unprotected-or-losing)
 - Orchestrator with the full daily schedule
 - SQLite trade history (`trades.db`) and post-mortem self-tuning
 - XGBoost prediction model transition at 50+ trades
 - launchd startup script, iMessage failure alerts, dashboard
+
+At startup, the bot cancels orphan open orders and restores a missing
+whole-share trailing stop for each open position. Before a reversal or
+manual close, it cancels symbol orders and waits for Alpaca to release
+reserved quantity. End-of-day liquidation is controlled by
+`EOD_CLOSE_MINUTES_BEFORE` in `config.py`.
 
 ## 4. Suggested next steps
 

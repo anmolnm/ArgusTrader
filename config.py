@@ -95,6 +95,7 @@ MARKET_OPEN_HOUR_ET = 9
 MARKET_OPEN_MINUTE_ET = 30
 MARKET_CLOSE_HOUR_ET = 16
 MARKET_CLOSE_MINUTE_ET = 0
+EOD_CLOSE_MINUTES_BEFORE = 5
 
 # ---------------------------------------------------------------------------
 # Persistence
