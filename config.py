@@ -84,9 +84,11 @@ POSITION_SIZE_PCT = {
 # ---------------------------------------------------------------------------
 MAX_OPEN_POSITIONS = 8
 MAX_PORTFOLIO_RISK_PCT = 0.80   # max % of cash deployed across all positions
+CAPITAL_RESERVE_PCT = 0.10      # keep a 10% reserve so filled-but-unsettled orders do not overstate capital
 DEFAULT_STOP_LOSS_PCT = 0.02    # 2.0% trailing stop
 MIN_WIN_PROBABILITY = 0.50      # rule-based risk gate threshold
 MIN_TICKER_SCORE = 4.0          # out of 10, only used once a ticker-research agent exists
+REVERSAL_COOLDOWN_SECONDS = 90  # prevent rapid same-symbol close/reopen churn while settlement is clearing
 
 ENTRY_CUTOFF_HOUR_ET = 15
 ENTRY_CUTOFF_MINUTE_ET = 30  # no new positions after 3:30 PM ET

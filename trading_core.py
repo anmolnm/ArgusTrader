@@ -82,6 +82,7 @@ class TradeExecutor:
         )
         self._symbol_locks = {}
         self._symbol_locks_guard = threading.Lock()
+        self._last_symbol_action = {}
         logger.info("Connected to Alpaca (%s)", "paper" if config.ALPACA_PAPER else "LIVE")
 
     # ------------------------------------------------------------------
@@ -110,11 +111,106 @@ class TradeExecutor:
         except Exception:
             return None
 
+    def record_symbol_action(self, symbol: str) -> None:
+        if not hasattr(self, "_last_symbol_action"):
+            self._last_symbol_action = {}
+        self._last_symbol_action[symbol] = time.monotonic()
+
+    def can_trade_symbol(self, symbol: str, now: Optional[float] = None) -> bool:
+        now = time.monotonic() if now is None else now
+        last_action = self._last_symbol_action.get(symbol)
+        if last_action is None:
+            return True
+        return (now - last_action) >= config.REVERSAL_COOLDOWN_SECONDS
+
     def open_position_count(self) -> int:
         return len(self.get_open_positions())
 
     def has_capacity_for_new_position(self) -> bool:
         return self.open_position_count() < config.MAX_OPEN_POSITIONS
+
+    def has_effective_capital_for_trade(self, required_notional: float) -> bool:
+        if required_notional <= 0:
+            return False
+        try:
+            account = self.get_account()
+        except Exception as e:
+            logger.warning("Unable to fetch account while checking capital: %s", e)
+            return False
+
+        cash = float(getattr(account, "cash", 0.0) or 0.0)
+        buying_power = float(getattr(account, "buying_power", cash) or 0.0)
+        available = min(cash, buying_power)
+        reserve = available * config.CAPITAL_RESERVE_PCT
+        effective_capital = max(0.0, available - reserve)
+        return required_notional <= effective_capital
+
+    def get_trade_state_summary(self) -> dict:
+        """Expose a compact runtime health snapshot for monitoring and logs."""
+        now = time.monotonic()
+        open_positions = {}
+        try:
+            for position in self.get_open_positions():
+                symbol = getattr(position, "symbol", None) or position.get("symbol")
+                qty = float(getattr(position, "qty", 0.0) or 0.0)
+                side = "long" if qty > 0 else "short"
+                open_positions[symbol] = {
+                    "qty": qty,
+                    "side": side,
+                    "market_value": getattr(position, "market_value", None),
+                }
+        except Exception as e:
+            logger.warning("Trade monitor could not read open positions: %s", e)
+
+        pending_orders = {}
+        try:
+            open_orders = self.client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
+            for order in open_orders:
+                symbol = getattr(order, "symbol", None) or order.get("symbol")
+                pending_orders.setdefault(symbol, []).append({
+                    "id": getattr(order, "id", None),
+                    "side": getattr(order, "side", None),
+                    "type": getattr(order, "type", None),
+                    "qty": getattr(order, "qty", None),
+                    "status": getattr(order, "status", None),
+                })
+        except Exception as e:
+            logger.warning("Trade monitor could not read pending orders: %s", e)
+
+        symbol_cooldowns = {}
+        for symbol, last_action in getattr(self, "_last_symbol_action", {}).items():
+            remaining = config.REVERSAL_COOLDOWN_SECONDS - (now - last_action)
+            if remaining > 0:
+                symbol_cooldowns[symbol] = round(max(0.0, remaining), 1)
+
+        try:
+            account = self.get_account()
+            cash = float(getattr(account, "cash", 0.0) or 0.0)
+            buying_power = float(getattr(account, "buying_power", cash) or 0.0)
+            effective_capital = max(0.0, min(cash, buying_power) * (1 - config.CAPITAL_RESERVE_PCT))
+        except Exception as e:
+            logger.warning("Trade monitor could not read account capital: %s", e)
+            effective_capital = None
+
+        return {
+            "timestamp": now,
+            "open_positions": open_positions,
+            "pending_orders": pending_orders,
+            "symbol_cooldowns": symbol_cooldowns,
+            "effective_capital": effective_capital,
+            "needs_attention": bool(pending_orders or symbol_cooldowns),
+        }
+
+    def log_trade_state_summary(self) -> dict:
+        summary = self.get_trade_state_summary()
+        logger.info(
+            "TRADE STATE: positions=%s pending_orders=%s cooldowns=%s effective_capital=%s",
+            list(summary["open_positions"].keys()),
+            {k: len(v) for k, v in summary["pending_orders"].items()},
+            summary["symbol_cooldowns"],
+            summary["effective_capital"],
+        )
+        return summary
 
     # ------------------------------------------------------------------
     # Order fill confirmation
@@ -204,6 +300,7 @@ class TradeExecutor:
                          "closing position via safety net", symbol)
             self._safety_net_close(symbol)
 
+        self.record_symbol_action(symbol)
         return TradeResult(
             success=True, protected=protected, symbol=symbol, side="long",
             notional=notional, order_id=str(order.id),
@@ -251,6 +348,7 @@ class TradeExecutor:
                          "closing position via safety net", symbol)
             self._safety_net_close(symbol)
 
+        self.record_symbol_action(symbol)
         return TradeResult(
             success=True, protected=protected, symbol=symbol, side="short",
             qty=fill_qty, order_id=str(order.id),
@@ -427,6 +525,7 @@ class TradeExecutor:
                 if filled is None or filled.status not in FILLED_STATUSES:
                     logger.warning("%s: close order did not confirm fill before timeout", symbol)
                     return False
+        self.record_symbol_action(symbol)
         logger.info("Closed position: %s", symbol)
         return True
 

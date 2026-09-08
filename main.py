@@ -120,6 +120,11 @@ def _handle_signal_locked(signal, executor: TradeExecutor, risk_agent: RuleBased
         logger.info("%s: past entry cutoff (%s ET), no new positions", symbol, config.ENTRY_CUTOFF_HOUR_ET)
         return
 
+    # --- Symbol cooldown: prevent churn on same ticker while settlement is clearing ---
+    if not executor.can_trade_symbol(symbol):
+        logger.info("%s: symbol cooldown active for %.0f seconds, skipping entry", symbol, config.REVERSAL_COOLDOWN_SECONDS)
+        return
+
     # --- Entry rule 4: max open positions ---
     if not executor.has_capacity_for_new_position():
         logger.info("%s: max open positions (%d) reached, skipping entry", symbol, config.MAX_OPEN_POSITIONS)
@@ -140,6 +145,10 @@ def _handle_signal_locked(signal, executor: TradeExecutor, risk_agent: RuleBased
     notional = executor.calc_position_notional(MACRO_SENTIMENT, target_side)
     if notional <= 0:
         logger.info("%s: no capital allocated for this direction/macro combo", symbol)
+        return
+    if not executor.has_effective_capital_for_trade(notional):
+        logger.info("%s: insufficient effective capital for %s entry (needed $%.2f, reserve active)",
+                    symbol, target_side, notional)
         return
 
     if target_side == "long":
@@ -189,6 +198,7 @@ def main():
         closed_date = maybe_close_end_of_day(executor, now_et, closed_date)
         if is_market_open(now_et) and closed_date != now_et.date():
             try:
+                executor.log_trade_state_summary()
                 run_once(executor, engine, risk_agent)
             except Exception as e:
                 logger.error("Error during scan cycle: %s", e, exc_info=True)

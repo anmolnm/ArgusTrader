@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased -- fill-race-condition fix (from Aug 21 & 24 log analysis)
+## Unreleased -- fill-race-condition fix plus runtime trade-state monitoring
+
+### Added after Sep 7-8 monitor and protection review
+- **`trading_core.py`**: adds `get_trade_state_summary()` / `log_trade_state_summary()`
+  to summarize open positions, pending orders, active symbol cooldowns,
+  and effective capital for each polling cycle.
+- **`trading_core.py`**: records last action timestamps per symbol and exposes
+  `can_trade_symbol()` to avoid rapid same-symbol churn while settlement is clearing.
+- **`trading_core.py`**: adds `has_effective_capital_for_trade()` using a reserve
+  threshold so the bot does not overstate deployable capital while orders are unsettled.
+- **`config.py`**: adds `REVERSAL_COOLDOWN_SECONDS` and `CAPITAL_RESERVE_PCT` as
+  explicit safety controls instead of hardcoded behavior.
+- **`main.py`**: logs the trade-state summary before every market scan and blocks
+  entries when the symbol is in cooldown or effective capital is insufficient.
 
 ### Added after Aug 25-26 log review
 - **`trading_core.py`**: cancels symbol-scoped open orders before exits and
